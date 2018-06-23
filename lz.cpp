@@ -1,3 +1,4 @@
+#define _CRT_SECURE_NO_WARNINGS
 #include <algorithm>
 #include <array>
 #include <cassert>
@@ -18,9 +19,51 @@ struct match_t {
   uint32_t len;
 };
 
+// return next power of two
+static size_t _npot(size_t size) {
+  size -= size ? 1 : 0;
+  size |= size >> 16;
+  size |= size >> 8;
+  size |= size >> 4;
+  size |= size >> 2;
+  size |= size >> 1;
+  return size + 1;
+}
+
+// write variable length quantity
+static void _vlq_write(uint8_t *&out, uint32_t val) {
+  std::array<uint8_t, 16> data;
+  int32_t i = 0;
+  for (; val; ++i) {
+    data[i] = val & 0x7f;
+    val >>= 7;
+  }
+  do {
+    --i;
+    *(out++) = data[i] | (i ? 0x80 : 0x00);
+  } while (i > 0);
+}
+
+// read variable length quantity
+static uint32_t _vlq_read(const uint8_t *&out) {
+  uint32_t val = 0;
+  for (;;) {
+    const uint8_t c = *(out++);
+    val = (val << 7) | (c & 0x7f);
+    if ((c & 0x80) == 0) {
+      break;
+    }
+  }
+  return val;
+}
+
 // find longest match in window
-static match_t match(const uint8_t *start, const uint8_t *end,
-                     const uint8_t *data, const uint8_t *data_end) {
+static match_t _match(const uint8_t *start, const uint8_t *end,
+                      const uint8_t *data, const uint8_t *data_end) {
+
+  // XXX: this could very quickly become a bottle neck and requires
+  //      some acceleration structure I feel.
+
   match_t out = {nullptr, 0};
   for (const uint8_t *x = start; x < end; ++x) {
     const uint32_t mod = (end - x);
@@ -40,39 +83,28 @@ static match_t match(const uint8_t *start, const uint8_t *end,
   return out;
 }
 
-// write variable length quantity
-static void vlq_write(uint8_t *&out, uint32_t val) {
-  std::array<uint8_t, 16> data;
-  int32_t i = 0;
-  for (; val; ++i) {
-    data[i] = val & 0x7f;
-    val >>= 7;
-  }
-  do {
-    --i;
-    *(out++) = data[i] | (i ? 0x80 : 0x00);
-  } while (i > 0);
-}
-
 // flush the entry list
-void flush_list(std::vector<entry_t> &list, uint8_t *&dst, const uint8_t *end) {
+static void _flush_list(std::vector<entry_t> &list, uint8_t *&dst,
+                        const uint8_t *end) {
   int32_t count = 0;
+  int32_t size = list.size();
   if (list.front().match) {
     for (const auto &i : list) {
       if (count == 0) {
-        count = std::min<int>(0x7f, list.size());
+        count = std::min<int>(0x7f, size);
         *(dst++) = uint8_t(count) | 0x80;
+        size -= count;
       }
-      vlq_write(dst, i.offset);
-      vlq_write(dst, i.length);
+      _vlq_write(dst, i.offset);
+      _vlq_write(dst, i.length);
       --count;
     }
   } else {
-    *(dst++) = count | 0x00;
     for (const auto &i : list) {
       if (count == 0) {
-        count = std::min<int>(0x7f, list.size());
+        count = std::min<int>(0x7f, size);
         *(dst++) = uint8_t(count) | 0x00;
+        size -= count;
       }
       *(dst++) = i.data;
       --count;
@@ -82,13 +114,13 @@ void flush_list(std::vector<entry_t> &list, uint8_t *&dst, const uint8_t *end) {
 }
 
 // push an entry into the entry list flushing if needed
-void push_entry(std::vector<entry_t> &list, const entry_t &entry, uint8_t *&dst,
-                const uint8_t *end) {
+static void _push_entry(std::vector<entry_t> &list, const entry_t &entry,
+                        uint8_t *&dst, const uint8_t *end) {
   if (list.empty() || (list.front().match == entry.match)) {
     list.emplace_back(entry);
     return;
   }
-  flush_list(list, dst, end);
+  _flush_list(list, dst, end);
   list.emplace_back(entry);
 }
 
@@ -105,39 +137,26 @@ void encode(const uint8_t *src, uint8_t *dst, size_t src_size, size_t dst_size,
     // find max match in 64k window
     const uint8_t *match_start = std::max(base, src - 0xffff);
     // find longest match in dictionary
-    match_t m = match(match_start, src, src, base + src_size);
+    const match_t m = _match(match_start, src, src, base + src_size);
     // match offset from current write location
-    uint32_t offset = m.pos ? src - m.pos : 0;
+    const uint32_t offset = m.pos ? src - m.pos : 0;
     // if we have a profitable match
     // note: remember it is costly to split runs
     if (m.len >= 4) {
-      push_entry(entry, entry_t{true, offset, m.len, 0}, dst, end);
+      _push_entry(entry, entry_t{true, offset, m.len, 0}, dst, end);
       // increment source pointer
       src += m.len;
     } else {
-      push_entry(entry, entry_t{false, 0, 0, *src}, dst, end);
+      _push_entry(entry, entry_t{false, 0, 0, *src}, dst, end);
       // increment source pointer
       ++src;
     }
   }
-  flush_list(entry, dst, end);
+  _flush_list(entry, dst, end);
   // number of bytes written
   if (written) {
     *written = dst - base;
   }
-}
-
-// read variable length quantity
-static uint32_t vlq_read(const uint8_t *&out) {
-  uint32_t val = 0;
-  for (;;) {
-    const uint8_t c = *(out++);
-    val = (val << 7) | (c & 0x7f);
-    if ((c & 0x80) == 0) {
-      break;
-    }
-  }
-  return val;
 }
 
 void decode(const uint8_t *src, uint8_t *dst, size_t src_size, size_t dst_size,
@@ -149,8 +168,8 @@ void decode(const uint8_t *src, uint8_t *dst, size_t src_size, size_t dst_size,
     const uint8_t count = marker & 0x7f;
     if (marker & 0x80) {
       for (uint32_t i = 0; i < count; ++i) {
-        const uint32_t offset = vlq_read(src);
-        const uint32_t length = vlq_read(src);
+        const uint32_t offset = _vlq_read(src);
+        const uint32_t length = _vlq_read(src);
         assert(dst - offset >= base);
         for (uint32_t j = 0; j < length; ++j) {
           dst[j] = dst[j - offset];
@@ -165,25 +184,14 @@ void decode(const uint8_t *src, uint8_t *dst, size_t src_size, size_t dst_size,
   }
 }
 
-// return next power of two
-static size_t npot(size_t size) {
-  size -= size ? 1 : 0;
-  size |= size >> 16;
-  size |= size >> 8;
-  size |= size >> 4;
-  size |= size >> 2;
-  size |= size >> 1;
-  return size + 1;
-}
-
 // decode into a dynamicaly allocated memory buffer
-void* decode(const uint8_t *src, size_t src_size, size_t *out_size) {
+void *decode(const uint8_t *src, size_t src_size, size_t *out_size) {
   // initial allocation
   size_t size = 256;
-  uint8_t *base = (uint8_t*)malloc(size);
+  uint8_t *base = (uint8_t *)malloc(size);
   assert(base);
 
-  uint32_t dst = 0;
+  int32_t dst = 0;
 
   const uint8_t *end = src + src_size;
   while (src < end) {
@@ -192,12 +200,12 @@ void* decode(const uint8_t *src, size_t src_size, size_t *out_size) {
     if (marker & 0x80) {
       for (uint32_t i = 0; i < count; ++i) {
         // read match data
-        const uint32_t offset = vlq_read(src);
-        const uint32_t length = vlq_read(src);
+        const int32_t offset = _vlq_read(src);
+        const int32_t length = _vlq_read(src);
         assert(dst - offset >= 0);
         // realloc if needed
         if ((dst + length) >= size) {
-          base = (uint8_t*)realloc(base, size = npot(dst + length));
+          base = (uint8_t *)realloc(base, size = _npot(dst + length));
           assert(base);
         }
         // insert matches
@@ -209,7 +217,7 @@ void* decode(const uint8_t *src, size_t src_size, size_t *out_size) {
     } else {
       // realloc if needed
       if ((dst + count) >= size) {
-        base = (uint8_t*)realloc(base, size = npot(dst + count));
+        base = (uint8_t *)realloc(base, size = _npot(dst + count));
         assert(base);
       }
       // insert raw bytes
@@ -218,5 +226,13 @@ void* decode(const uint8_t *src, size_t src_size, size_t *out_size) {
       }
     }
   }
+  if (out_size) {
+    *out_size = dst;
+  }
   return base;
+}
+
+
+void* encode(const uint8_t *src, size_t src_size, size_t *written) {
+  return nullptr;
 }
